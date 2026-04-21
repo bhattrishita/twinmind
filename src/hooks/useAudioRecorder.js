@@ -3,10 +3,12 @@ import { useState, useRef, useCallback } from 'react';
 /**
  * Returns true when the audio blob is below the RMS silence threshold (0.01).
  * Prevents sending silent or near-silent chunks to Whisper.
+ * Uses vendor-prefixed AudioContext for cross-browser / Safari compatibility.
  */
 async function isSilent(audioBlob) {
-  const arrayBuffer  = await audioBlob.arrayBuffer();
-  const audioContext = new AudioContext();
+  const AudioCtx    = window.AudioContext || window.webkitAudioContext;
+  const arrayBuffer = await audioBlob.arrayBuffer();
+  const audioContext = new AudioCtx();
   const audioBuffer  = await audioContext.decodeAudioData(arrayBuffer);
   const channelData  = audioBuffer.getChannelData(0);
   const rms = Math.sqrt(
@@ -40,16 +42,23 @@ export function useAudioRecorder(onChunkReady, onSpeechPause) {
   const mediaRecorderRef = useRef(null);
   const streamRef        = useRef(null);
   const intervalRef      = useRef(null);
-  const audioContextRef  = useRef(null); // for pause detection
-  const rafRef           = useRef(null); // requestAnimationFrame ID
+  const audioContextRef  = useRef(null);  // for pause detection
+  const rafRef           = useRef(null);  // requestAnimationFrame ID
 
-  /** Picks the best supported mimeType for the current browser. */
+  // FIX 5: stable boolean flag readable inside rAF / setInterval closures
+  // without stale React state. Kept in sync with setIsRecording().
+  const isRecordingRef   = useRef(false);
+  // FIX 3: silence-start timestamp as a ref so the rAF loop reads it correctly
+  const silenceStartRef  = useRef(null);
+
+  /** FIX 2: returns the best MIME type supported by this browser. */
   function pickMimeType() {
     const candidates = [
       'audio/webm;codecs=opus',
       'audio/webm',
       'audio/ogg;codecs=opus',
       'audio/ogg',
+      'audio/mp4',               // Safari / iOS on deployment
     ];
     return candidates.find(t => MediaRecorder.isTypeSupported(t)) ?? '';
   }
@@ -91,50 +100,65 @@ export function useAudioRecorder(onChunkReady, onSpeechPause) {
       streamRef.current = stream;
 
       createRecorder(stream);
+
+      // FIX 5: set ref before setIsRecording so async loops see it immediately
+      isRecordingRef.current = true;
       setIsRecording(true);
 
-      // Every 30 s: flush current recorder → send chunk → start fresh recorder
+      // 30 s chunking interval — flush current recorder, start fresh one.
+      // FIX 4: also fires onSpeechPause as a fallback in case pause detection
+      // silently fails on the deployment environment.
       intervalRef.current = setInterval(() => {
         if (mediaRecorderRef.current?.state === 'recording') {
-          mediaRecorderRef.current.stop();   // triggers onstop → blob dispatched
-          createRecorder(streamRef.current); // new recorder starts immediately
+          mediaRecorderRef.current.stop();    // triggers onstop → blob dispatched
+          createRecorder(streamRef.current);  // new recorder starts immediately
         }
+        // Fallback trigger — maybeFetchSuggestions dedup guard prevents duplicates
+        onSpeechPauseRef.current?.();
       }, 30_000);
 
-      // ── Real-time pause detection via AnalyserNode ───────────────────────
-      const audioContext = new AudioContext();
+      // ── FIX 1 + FIX 3: explicit AudioContext setup ────────────────────────
+      // Use vendor-prefixed constructor and explicitly resume() — required on
+      // some browsers that start an AudioContext in 'suspended' state even when
+      // triggered by a user gesture.
+      const AudioCtx    = window.AudioContext || window.webkitAudioContext;
+      const audioContext = new AudioCtx();
+      await audioContext.resume();
       audioContextRef.current = audioContext;
-      const microphone = audioContext.createMediaStreamSource(stream);
-      const analyser   = audioContext.createAnalyser();
+
+      // FIX 3: explicit audio graph — source → analyser (no destination needed)
+      const source   = audioContext.createMediaStreamSource(stream);
+      const analyser = audioContext.createAnalyser();
       analyser.fftSize = 512;
-      microphone.connect(analyser);
-      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      source.connect(analyser);
 
-      let silenceStart = null;
-
+      // FIX 3: silence-detection loop using isRecordingRef as a stop signal
       function checkSilence() {
+        // FIX 5: bail out immediately if recording has already stopped
+        if (!isRecordingRef.current) return;
+
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
         analyser.getByteFrequencyData(dataArray);
         const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
 
         if (avg < SILENCE_THRESHOLD) {
-          if (!silenceStart) {
-            silenceStart = Date.now();
-          } else if (Date.now() - silenceStart >= SILENCE_DURATION) {
-            silenceStart = null; // reset so it won't fire again until the next distinct pause
+          if (!silenceStartRef.current) {
+            silenceStartRef.current = Date.now();
+          } else if (Date.now() - silenceStartRef.current >= SILENCE_DURATION) {
+            silenceStartRef.current = null; // reset so it won't fire again until next distinct pause
 
-            // Flush the current audio chunk immediately so the user's last sentence
-            // reaches Whisper within ~2 s of them stopping, rather than waiting up to
-            // 30 s for the regular chunking interval.
+            // Flush current chunk to Whisper immediately — no need to wait 30 s
             if (mediaRecorderRef.current?.state === 'recording') {
-              mediaRecorderRef.current.stop();    // triggers onstop → blob sent to Whisper
+              mediaRecorderRef.current.stop();    // onstop → blob sent to Whisper
               createRecorder(streamRef.current);  // fresh buffer — no audio duplication
             }
 
             onSpeechPauseRef.current?.(); // let App decide whether to fetch suggestions
           }
         } else {
-          silenceStart = null; // user is speaking — reset the clock
+          silenceStartRef.current = null; // user is speaking — reset the clock
         }
+
         rafRef.current = requestAnimationFrame(checkSilence);
       }
       rafRef.current = requestAnimationFrame(checkSilence);
@@ -146,7 +170,12 @@ export function useAudioRecorder(onChunkReady, onSpeechPause) {
   }, [createRecorder]);
 
   const stopRecording = useCallback(() => {
-    // Cancel the silence-detection loop first
+    // FIX 5: signal the rAF loop to exit before cancelling the frame —
+    // this prevents a race where the loop fires one more time after cancel.
+    isRecordingRef.current  = false;
+    silenceStartRef.current = null;
+
+    // Cancel the silence-detection loop
     if (rafRef.current) {
       cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
