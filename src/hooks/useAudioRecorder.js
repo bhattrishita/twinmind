@@ -75,7 +75,12 @@ export function useAudioRecorder(onChunkReady, onSpeechPause) {
     const chunks   = [];
 
     recorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) chunks.push(e.data);
+      if (e.data && e.data.size > 0) {
+        if (process.env.NODE_ENV === 'development') {
+          console.log(`[recorder] ondataavailable: ${e.data.size} bytes`);
+        }
+        chunks.push(e.data);
+      }
     };
 
     recorder.onstop = async () => {
@@ -110,8 +115,9 @@ export function useAudioRecorder(onChunkReady, onSpeechPause) {
       // silently fails on the deployment environment.
       intervalRef.current = setInterval(() => {
         if (mediaRecorderRef.current?.state === 'recording') {
-          mediaRecorderRef.current.stop();    // triggers onstop → blob dispatched
-          createRecorder(streamRef.current);  // new recorder starts immediately
+          mediaRecorderRef.current.requestData(); // flush buffered audio immediately
+          mediaRecorderRef.current.stop();        // triggers onstop → blob dispatched
+          createRecorder(streamRef.current);      // new recorder starts immediately
         }
         // Fallback trigger — maybeFetchSuggestions dedup guard prevents duplicates
         onSpeechPauseRef.current?.();
@@ -149,8 +155,9 @@ export function useAudioRecorder(onChunkReady, onSpeechPause) {
 
             // Flush current chunk to Whisper immediately — no need to wait 30 s
             if (mediaRecorderRef.current?.state === 'recording') {
-              mediaRecorderRef.current.stop();    // onstop → blob sent to Whisper
-              createRecorder(streamRef.current);  // fresh buffer — no audio duplication
+              mediaRecorderRef.current.requestData(); // flush buffered audio right now
+              mediaRecorderRef.current.stop();        // onstop → blob sent to Whisper
+              createRecorder(streamRef.current);      // fresh buffer — no audio duplication
             }
 
             onSpeechPauseRef.current?.(); // let App decide whether to fetch suggestions
@@ -188,8 +195,10 @@ export function useAudioRecorder(onChunkReady, onSpeechPause) {
     clearInterval(intervalRef.current);
     intervalRef.current = null;
 
-    // Stop the active recorder — this fires onstop → final chunk dispatched
+    // Stop the active recorder — requestData flushes any buffered audio first,
+    // then stop() fires onstop → final chunk dispatched to Whisper
     if (mediaRecorderRef.current?.state === 'recording') {
+      mediaRecorderRef.current.requestData(); // capture anything buffered since last 250 ms slice
       mediaRecorderRef.current.stop();
     }
     mediaRecorderRef.current = null;

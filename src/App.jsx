@@ -64,6 +64,11 @@ export default function App() {
   // Used to skip fetches when the transcript hasn't changed since the last batch.
   const lastSuggestedLengthRef = useRef(0);
 
+  // Stable ref so handleChunkReady (useCallback with [] deps) always calls the
+  // latest fetchSuggestions without needing it in the dependency array.
+  const fetchSuggestionsRef = useRef(fetchSuggestions);
+  fetchSuggestionsRef.current = fetchSuggestions;
+
   // ── Chat ─────────────────────────────────────────────────────────────────
   const { messages: chatMessages, isLoading: chatLoading, sendMessage } = useChat({
     chatPrompt:           settings.chatPrompt,
@@ -104,13 +109,17 @@ export default function App() {
           text,
           timestamp: recordingStartRef.current + elapsed,
         };
-        // Update ref immediately so the pause-detection callback always reads
-        // the complete, latest transcript when it fires.
+        // Update ref immediately so any concurrent callbacks read the latest state.
         const updatedTranscript = [...transcriptRef.current, newChunk];
-        transcriptRef.current = updatedTranscript;
+        transcriptRef.current   = updatedTranscript;
         setTranscript(updatedTranscript);
-        // Suggestions are triggered by pause detection (onSpeechPause) and on
-        // stop — not here. No fetchSuggestions call on every chunk.
+
+        // Trigger suggestions immediately — no waiting for a pause/stop event.
+        // useSuggestions' internal isLoadingRef guard prevents concurrent fetches.
+        // lastSuggestedLengthRef is synced so the stop-handler fallback is a no-op
+        // when the last chunk already triggered a fetch.
+        lastSuggestedLengthRef.current = updatedTranscript.length;
+        fetchSuggestionsRef.current(updatedTranscript);
       }
     } catch {
       setTranscriptError('failed-final');
